@@ -1,0 +1,20 @@
+{
+    "__default__":
+    {
+	"partition" : "bigmemh"
+    },
+    "job1":
+    {
+	"cpus-per-task": 1,
+	"p" : "bigmmeh",
+	"o" : "slurm-logs/%j_out.txt",
+	"e" : "slurm-logs/%j_error.txt"
+    },
+    "job2":
+    {
+	"cpus-per-task": 1,
+	"p" : "main"
+	"o" : "slurm-logs/%j_out.txt",
+	"e" : "slurm-logs/%j_error.txt"
+    },
+}

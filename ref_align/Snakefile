@@ -1,0 +1,47 @@
+SAMPLES=["Lo8","Tvic","Tvid"]
+
+
+rule all:
+     input:
+	expand("{samples}.fastq.gz",samples=SAMPLES)
+     output:
+	"{samples}_filtered_snps.vcf"
+	"{samples}_filtered_indels.vcf"
+
+
+rule run_fastqc:
+     input:
+	"{samples}_R1.fastq.gz"
+	"{samples}_R2.fastq.gz"
+     output:
+        directory({samples}_fastqc)
+	"{samples}_fastqc"
+     shell:
+	"fastqc {input} -o {output}"
+
+
+rule run_trimmomatic:
+     input:
+	"{samples}_R1.fastq.gz"
+        "{samples}_R2.fastq.gz"
+     output:
+	"{samples}_1.pe.qc.fq.gz"
+	"{samples}_1.se.qc.fq.gz"
+	"{samples}_2.pe.qc.fq.gz"
+	"{samples}_2.se.qc.fq.gz"
+    shell:
+	"""trimmomatic PE {input} {output} LEADING:2 TRAILING:2 \
+         SLIDINGWINDOW:4:15 MINLEN:25"""
+
+rule run_bwa:
+     input:
+	"{genome}.fa"
+	"{samples}_1.pe.qc.fq.gz"
+	"{samples}_2.pe.qc.fq.gz"
+     output:
+	"{samples}.bam"
+     shell:
+	"bwa mem -M -t 16 {input} | java -Xmx40g -jar {picard} SortSam \
+	OUTPUT={sample}.bam \
+	SORT_ORDER=coordinate"
+

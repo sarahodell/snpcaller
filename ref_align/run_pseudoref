@@ -1,0 +1,342 @@
+#!/usr/bin/env python
+
+"""
+Execution script for snakemake pseudoref
+"""
+
+import argparse
+import os
+import sys
+import pprint
+import yaml
+import glob
+import collections
+import snakemake
+import shutil
+import subprocess
+
+from psr_utils.utils import *
+from psr_utils.pretty_config import pretty_name, write_config
+from psr_utils.print_workflow_options import print_available_workflows_and_tools
+from psr_utils.capture_stdout import CaptureStdout
+
+def build_default_params(workdir,targets):
+    defaultParams={}
+    # first, figure out which parts of the pipeline are being run, and get those defaults
+    pipeline_defaultsFile = find_yaml(workdir, os.path.join('psr_utils','pipeline_defaults'),'pipeline_defualts')
+    pipeline_defaults=read_yaml(pipeline_defaultsFile)
+    # grab general defaults
+    defaultParams['basename']=pipeline_defaults['basename']
+    # add main directories, outdirs available to all workflows
+    defaultParams['pseudoref_directories']=pipeline_defaults['pseudoref_directories']
+    # grab all available workflows, and subset by user input
+    psr_workflows = pipeline_defaults['pseudoref_workflows']
+    workflows_to_run = {k: psr_workflows[k] for k in psr_workflows.keys() & targets}
+    defaultParams['pseudoref_workflows']=workflows_to_run
+    # find targs the user entered that are not in our default info
+    extra_targs = [t for t in targets if t not in psr_workflows]
+    for e in extra_targs: # assume extra targets are single rules, and add to the workflow
+        workflows_to_run[e] = {'include':[e],'targets':[e]}
+    # For each rule in the desired workflow, save rulename and grab rule params
+    required_rules=[]
+    for targD in workflows_to_run.values():
+        required_rules+=targD.get('include',[])
+        required_rules+=targ.get('targets',[])
+    ruleParamsFiles = []
+    includeRules = []
+    reference_extensions = []
+    rules_dir = defaultParams['pseudoref_directories']['rules']
+    for rule_name in required_rules:
+        try:
+            rule = glob.glob(os.path.join(workdir,rules_dir,'*',rule_name + '.rule'))[0]
+            defaultParams[rule_name] = get_params(rule_name,os.path.dirname(rule))
+            reference_exts= defaultParams[rule_name]['pseudoref_params']['extensions'].get('reference_extensions',[])
+            reference_extensions+=reference_exts
+            includeRules += [rule]
+        except: # if allows user workflow input, can't do this here
+            sys.stderr.write("\n\tError: Can't add rules for extra target {}. Please fix.\n\n".format(e))
+            sys.exit(-1)
+    defaultParams['include_rules'] = list(set(includeRules))
+    defaultParams['reference_extensions'] = list(set(reference_extensions))
+    return defaultParams
+
+def build_dirs(psr_dir,params):
+    # build main pseudoref dir info
+    rules_dir = params['pseudoref_directories']['rules']
+    params['pseudoref_directories']['base_dir'] = psr_dir
+    params['pseudoref_directories']['rules'] = os.path.join(psr_dir,rules_dir)
+
+    # allow user to define basename and experiment, build outdir name
+    basename = params['basename']
+    if params.get('experiment'):
+        outdir = basename + "_out_" + params['experiment']
+    else:
+        outdir = basename + '_out'
+    params['pseudoref_directories']['out_dir'] = outdir #outdir NAME
+    # if we want logs to be *within* individual outdirs, change logsdir here (else logs in pseudoref dir)
+    params['pseudoref_directories']['logs'] = join(outdir, os.path.basename(params['pseudoref_directories']['logs']))
+    # if desired, user can also provide out_path, and all dirs will be built under there
+    # outdirectory, build all directories relative to that path
+    out_path = params.get('out_path',psr_dir)
+    # if user inputs an absolute path:
+    if os.path.isabs(out_path): # if not absolute, just assume subdirectory of pseudoref
+        assert os.path.exists(out_path) and os.path.isdir(out_path),"Error: provided output path {} is not an existing directory. Please fix.\n\n".format(out_path)
+    # Now join out_path, outdir name
+    outdir = os.path.join(out_path,outdir)
+    # build dirs for main pseudoref output directories
+    outDirs = params['pseudoref_directories']['outdirs']
+    for targ,outD in outDirs.items():
+        outDirs[targ] = os.path.join(outdir,outD)
+    # put joined paths back in params file
+    params['pseudoref_directories']['outdirs'] = outDirs
+    # build dirs for included rules
+
+    included_rules = params['include_rules']
+    for rule in included_rules:
+        prog=os.path.basename(rule).split('.rule')[0]
+        # if no outdir, just use program name
+        prog_dir = params[prog]['pseudoref_params'].get('outdir',prog)
+        params[prog]['pseudoref_params']['outdir'] = os.path.join(outdir,prog_dir)
+    return params
+
+
+def handle_referenceInput(refInput,config):
+    # find files
+    program_params=config['referenceinput'].get('program_params')
+    referencefile=program_params.get('reference'),None)
+    assert os.path.exists(referencefile),"Error: cannot find input reference genome oat {}\n".format(referencefile)
+    sys.stderr.write('\tFound input reference genome at {}\n'.format(referencefile))
+    extensions={}
+    input_reference_extension = program_params.get('reference_extension','')
+    config['referenceinput'] = {}
+    extensions['reference_extensions'] = ['input_assembly_extension']
+    config['referenceinput']['pseudoref_params'] = {'extensions': extensions}
+    return config, input_reference_extension
+
+
+def main(args):
+
+    thisdir = os.path.abspath(os.path.dirname(__file__))
+    # print available workflows and rules, if desired
+    if args.print_workflows or args.print_rules:
+        pipeline_defaultsFile = find_yaml(thisdir,os.path.join('psr_utils','pipeline_defaults'),'pipeline_defaults')
+        print_available_workflows_and_tools(read_yaml(pipeline_defaultsFile),args.print_workflows,args.print_rules)
+        sys.exit(0)
+    targs = args.targets
+    # handle "full" target
+    if 'full' in targs:
+        targs = ['align','call_variants','make_pseudo']
+    if args.print_params:
+        default_params = build_default_params(thisdir,targs)
+        write_config(default_params,targs)
+        sys.exit(0)
+
+    # are we building a directed acyclic graph?
+    building_dag=False
+    if args.dag or args.dagfile or args.dagpng:
+        building_dag=True
+
+        #building dags precludes running any workflows
+        args.dry_run = True
+
+        # if user specified --dagpng
+        #graphviz dot must be present
+        if args.dagpng:
+            if shutil.which('dot') is None:
+                sys.stderr.write("\n\tError: Cannot find 'dot' utility, but --dotpng flag was specified. Fix this by installing graphviz dot.\n\n")
+                sys.exit(-1)
+
+        # first, find the Snakefile and configfile
+        if not building_dag:
+            print('\n--------')
+            print('checking for required files:')
+            print('--------\n')
+
+        snakefile = find_Snakefile(thisdir)
+
+        if args.build_cofig:
+            configfile =args.configfile
+            if not any(ext in args.configfile for ext in ['.yaml','.yml']):
+                configfile = args.configfile+'.yaml'
+            if os.path.exists(configfile):
+                sys.stderr.write("\n\tError: found configfile path at {},but you have --build_config specified. Please fix. \n\n".format(args.configfile))
+                sys.exit(-1)
+            default_params=build_default_params(thisdir,targs)
+            write_config(default_params,targs,configfile)
+            sys.exit(0)
+        else:
+            configfile = find_yaml(thisdir,args.configfile,'configfile') # find configfile
+            if not configfile:
+                sys.stderr.write('Error: cannot find configfile {}\n.'.format(args.configfile))
+                sys.exit(-1)
+            # first grab all params in user config file
+            configD = import_configfile(configfile)
+            # build info for referenceInput
+            if refInput:
+                targs+=['referenceinput']
+                configD, referenceinput_ext = handle_referenceInput(refInput,configD)
+            else:
+                referenceinput_ext=None
+            if 'referenceinput' in targs and not refInput:
+                sys.stderr.write("\n\tError: trying to run 'referenceinput' workflow, but there's no reference file specified ub your configfile. Please fix.\n\n")
+                sys.exit(-1)
+            # next, grab all pseudoref defaults, including rule-specific default parameters (*_params.yaml files)
+            paramsD = build_default_params(thisdir,targs)
+            # add any configuration from extra config files
+            extra_configs = {}
+            if args.extra_config:
+                for c in args.extra_config:
+                    extra_configs = import_configfile(find_yaml(thisdir,c,'extra_config'),extra_configs)
+            # this function only updates keys that already exist. so we need to wait til here (after importing params) to read in extra_configs
+            # rather than doing this wehn reading in the main configfile
+            # first update with extra configs, then with main configfile
+            update_nested_dict(paramsD,extra_configs)
+            # update defaults with user-specified parameters
+            update_nested_dict(paramsD,configD) # configD takes priority over default params
+
+            # add extension to overall reference_extensions info
+            if referenceinput_ext: # note: need to do it here to prevent override with defaults
+                paramsD['reference_extensions'] = list(set(paramsD.get('reference_extensions',[]) + [referenceinput_ext]))
+
+            
+            # use params to build directory structure
+            paramsD = build_dirs(thisdir, paramsD)
+            # Note: passing a configfile allows nested yaml/dictionary format.
+            # Passing these params in via 'config' would require flat dictionary
+            paramsfile = os.path.join(os.path.dirname(configfile), '.psr_' + os.path.basename(configfile))
+            sys.stderr.write('\tAdded default parameters from rule-specific params files.\n\tWriting full params to {}\n'.format(paramsfile))
+            write_yaml(paramsD,paramsfile)
+            reportfile=None
+            if args.report:
+                if os.path.isabs(args.report):
+                    reportfile=args.report
+                else:
+                    reportfile = os.path.abspath(os.path.join(paramsD['pseudoref_directories']['logs'].args.report))
+
+            if not building_dag:
+                print('--------')
+                print('details!')
+                print('\tsnakefile: {}'.format(snakefile))
+                print('\tconfig: {}'.format(configfile))
+                print('\tparams: {}'.format(paramsfile))
+                print('\ttargets: {}'.format(repr(targs)))
+                print('\treport: {}'.format(repr(reportfile)))
+                print('--------')
+
+            # set up a context manager to capture stdout if we're building
+            # a directed acyclic graph (which prints the graph in dot format
+            # to stdout instead of to a file).
+            # If we are not building a dag, pass all output straight to stdout
+            # without capturing any of it.
+            passthru = not building_dag
+            with CaptureStdout(passthru=passthru) as output:
+                # run!!
+                # params file become snakemake configfile
+                status = snakemake.snakemake(snakefile,configfile=paramsfile,use_conda=True,
+                                             targets=['pseudoref'],printshellcmds=True,
+                                             cores=args.threads, cleanup_conda=args.cleanup_conda,
+                                             dryrun=args.dry_run, lock=not args.nolock,
+                                             unluck=args.unlock,
+                                             verbose=args.verbose, debug_dag=args.debug,
+                                             conda_prefix=args.conda_prefix,
+                                             create_envs_only=args.create_envs_only,
+                                             restart_times=args.restart_times,
+                                             printdag=building_dag,keepgoing=args.keep_going,
+                                             forcetargets=args.forcetargets,forceall=args.forceall)
+
+            if building_dag:
+
+                # These three --build args are mutually exclusive,
+                # and are checked in order of precedence (hi to low):
+                # --dag   to stdout
+                # --dagfile  to .dot
+                # --dagpng   to .png
+
+                if args.dag:
+                    # straight to stdout
+                    print("\n".join(output))
+
+                elif args.dagfile:
+                    with open(args.dagfile,'w') as f:
+                        f.write("\n".join(output))
+                    print("\tPrinted workflow dag to dot file {}\n\n".format(args.dagfile))
+
+                elif args.dagpng:
+                    # dump dot output to temporary dot file
+                    with open('.temp.dot','w') as f:
+                        f.write("\n".join(output))
+                    subprocess.call(['dot','-Tpng','.temp.dot','-o',args.dagpng])
+                    subprocess.call(['rm','-f','.temp.dot'])
+                    print("\tPrinted workflow dag to png file {}\n\n".format(args.dagpng))
+
+            if status and reportfile and not args.dry_run and not args.unlock and not building_dag:
+                snakemake.snakemake(snakefile,configfile=paramsfile,report=reportfile)
+                print("\t See the report file at {}\n\n".format(reportfile))
+
+            if status: # translate "success" into shell exit code of 0
+                return 0
+            return 1
+
+
+        
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='run snakemake pseudoref',usage='''run_pseudoref <configfile.yaml> [<targets> ...]
+
+    Run pseudoref snakemake workflows, using the given configfile.
+
+
+Available Workflows:
+    default        - run full pseudoref workflow
+    preprocess     - preprocess reads
+    align          - align reads to reference genome
+    call_variants  - call variants (snp/indel) from .bam files compared to reference genome
+    make_pseudo    - create a pseudoreference of the reference genome with variants from samples
+
+For a quickstart, run this:
+    ./run_pseudoref examples/example/yaml
+
+from the main pseudoref directory.
+
+    To build an editable configfile to start work on your own data, run:
+    ./run_pseudoref my_config --build_config    
+ 
+''')
+    parser.add_argument('configfile')
+    parser.add_argument('targets',nargs='*',default=['default'])
+    parser.add_argument('-t','--threads',type=int,default=1)
+    parser.add_argument('--extra_config', action='append',default=None)
+    parser.add_argument('-n','--dry-run',action='store_true')
+    parser.add_argument('-v','--verbose',action='store_true')
+    parser.add_argument('w','--print_workflows',action='store_true',
+                        help='just show available workflows')
+    parser.add_argument('-r','--print_rules',action='store_true',
+                        help='just show available rules')
+    parser.add_argument('-p','--print_params',action='store_true',
+                        help='print parameters for chose workflow or rules')
+    parser.add_argument('--build_config',action='store_true',help='just build the default parameter file')
+    # advanced args below (maybe separate so thes don't always print out)
+    parser.add_argument('--report',default="report.html",
+                        help='filename for a final report of this run. This will be in the logs dir, unless you provide an absolute path.')
+    parser.add_argument('--conda_prefix',default=None,help='location for conda environment installs')
+    parser.add_argument('--create_envs_only',action='store_true',help="just install software in conda envs, don't execute workflows")
+    parser.add_argument('-d','--debug',action='store_true')
+    parser.add_argument('--dag',action='store_true',help='boolean: output a flowchart of the directed acyclic graph of this workflow in graphviz dot format (does not require/run dot)')
+    parser.add_argument('--dagfile',default=None,help='filename to output a flowchart of the directed acyclic graph of this workflow in graphviz do format')
+    parser.add_argument('--dagpng',default=None,help='filename to output a flowchart of the directed acyclic graph of this workflow in png image format')
+    parser.add_argument('-k','--keep_going',action='store_true')
+    parser.add_argument('--nolock',action='store_true')
+    parser.add_argument('--unlock',action='store_true')
+    parser.add_argument('cleanup_conda',action='store_true')
+    parser.add_argument('--forcetargets',action='store_true',help='force given targets to be re-created (default=False)')
+    parser.add_argument('--forceall',action='store_true',help='force all output files to be re-created (default False)')
+    parser.add_argument('--restart_times',type=int,default=0,help='let snakemeake try rerunning any failed tools (input number of times to try rerunning). default = 0')
+    args.parser.parse_args()
+
+    sys.exit(main(args))
+
+
+
+                        
+
+    
+

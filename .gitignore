@@ -1,0 +1,10 @@
+*.DS_Store
+*.RData
+*.Rhistory
+slurm-logs
+*.sh~
+*.py~
+*.R~
+ref_align/psr_utils/__pycache__
+*.pl~
+.gitignore~
